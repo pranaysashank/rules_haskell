@@ -19,6 +19,7 @@ import Data.Maybe
 import System.FilePath
 import System.IO (hPutStrLn, stderr)
 
+import Exception (gtry)
 import GHC hiding (Succeeded)
 import GHC.Paths (libdir)
 import DynFlags
@@ -32,12 +33,12 @@ import DynFlags
   , defaultFlushOut
   , flagSpecFlag
   , flagSpecName
+  , gopt_set
   , warningGroups
   , warningHierarchies
   , wWarningFlags
   )
 import DriverPhases
-import DriverPipeline (compileFile)
 import ErrUtils
   ( MsgDoc
   , getCaretDiagnostic
@@ -45,7 +46,7 @@ import ErrUtils
   , pprErrMsgBagWithLoc
   )
 import HscTypes (handleFlagWarnings, hsc_dflags, srcErrorMessages)
-import Panic (fromException, try)
+import Panic (fromException)
 import PlainPanic (PlainGhcException(PlainPanic))
 import Outputable
 import Util
@@ -160,7 +161,7 @@ compileOneShot flags workerVerbosity = CompileM $ ReaderT $ \dflagsState0 -> do
     logsRef <- liftIO $ newIORef []
 
     let
-      dflags3 = dflags2
+      dflags3 = (`gopt_set` Opt_ForceRecomp) dflags2
         { ldInputs = map (FileOption "") objs ++ ldInputs dflags2
         , ghcMode = OneShot
         , log_action = renderLog $ \msg -> do
@@ -171,7 +172,8 @@ compileOneShot flags workerVerbosity = CompileM $ ReaderT $ \dflagsState0 -> do
 
     _ <- setSessionDynFlags dflags3
 
-    st0 <- collectStatus logsRef $ handleFlagWarnings dflags3 dynamicFlagWarnings
+    st0 <- collectStatus logsRef $ liftIO $
+             handleFlagWarnings dflags3 dynamicFlagWarnings
     if isErrorStatus st0 then
       return st0
     else
@@ -183,21 +185,22 @@ doCompile :: IORef [String] -> [(String, Maybe Phase)] -> Ghc Status
 doCompile logsRef srcs = do
     let (hs_srcs, non_hs_srcs) = partition isHaskellishTarget srcs
     if null (non_hs_srcs) then do
-      hsc_env <- GHC.getSession
+      targets <- mapM (uncurry GHC.guessTarget) hs_srcs
+      GHC.setTargets targets
+
       collectStatus logsRef $
-        mapM_ (compileFile hsc_env StopLn) hs_srcs
+        GHC.load LoadAllTargets
     else
       return $ NonHaskellInputs $ map fst non_hs_srcs
 
 -- | Creates a status from the exceptions thrown by the given action
 -- and the logs in the given 'IORef'.
-collectStatus :: IORef [String] -> IO () -> Ghc Status
+collectStatus :: IORef [String] -> Ghc a -> Ghc Status
 collectStatus logsRef action = do
     hsc_env <- GHC.getSession
-    liftIO $ do
-      ee <- try action
-      logs <- reverse <$> readIORef logsRef
-      case ee of
+    ee <- gtry action
+    logs <- reverse <$> liftIO (readIORef logsRef)
+    case ee of
         Left se -> case fromException se of
           Just e -> do
             return $
@@ -214,7 +217,7 @@ collectStatus logsRef action = do
                 return $
                   CompileErrors logs [show (e :: GhcException)]
               _ ->
-                throwIO se
+                liftIO (throwIO se)
         Right _ ->
           return (Succeeded logs)
   where
